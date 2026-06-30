@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -35,6 +36,8 @@ type Inbound struct {
 	logger    logger.ContextLogger
 	listener  *listener.Listener
 	service   *anytls.Service
+	userconns sync.Map
+	uuidlist  []string
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AnyTLSInboundOptions) (adapter.Inbound, error) {
@@ -69,6 +72,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		return nil, err
 	}
 	inbound.service = service
+	for _, user := range options.Users {
+		inbound.uuidlist = append(inbound.uuidlist, user.Name)
+	}
 	inbound.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -127,6 +133,10 @@ func (h *inboundHandler) NewConnectionEx(ctx context.Context, conn net.Conn, sou
 	if userName, _ := auth.UserFromContext[string](ctx); userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
+		h.userconns.Store(conn, userName)
+		onClose = N.AppendClose(onClose, func(err error) {
+			h.userconns.Delete(conn)
+		})
 	} else {
 		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
 	}
