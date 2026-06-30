@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -36,6 +37,9 @@ type Inbound struct {
 	tlsConfig    tls.ServerConfig
 	service      *hysteria2.Service[int]
 	userNameList []string
+	uuidToUid    map[string]int
+	uidToUuid    map[int]string
+	userconns    sync.Map
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2InboundOptions) (adapter.Inbound, error) {
@@ -140,6 +144,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	service.UpdateUsers(userList, userPasswordList)
 	inbound.service = service
 	inbound.userNameList = userNameList
+	inbound.uidToUuid = make(map[int]string)
+	inbound.uuidToUid = make(map[string]int)
 	return inbound, nil
 }
 
@@ -156,9 +162,13 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
 	userID, _ := auth.UserFromContext[int](ctx)
-	if userName := h.userNameList[userID]; userName != "" {
+	if userName, found := h.uidToUuid[userID]; found && userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
+		h.userconns.LoadOrStore(conn, userName)
+		onClose = N.AppendClose(onClose, func(err error) {
+			h.userconns.Delete(conn)
+		})
 	} else {
 		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
 	}
@@ -178,7 +188,7 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
 	userID, _ := auth.UserFromContext[int](ctx)
-	if userName := h.userNameList[userID]; userName != "" {
+	if userName, found := h.uidToUuid[userID]; found && userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
 	} else {
