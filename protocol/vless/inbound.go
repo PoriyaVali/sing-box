@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -43,6 +44,7 @@ type Inbound struct {
 	service   *vless.Service[int]
 	tlsConfig tls.ServerConfig
 	transport adapter.V2RayServerTransport
+	userconns sync.Map
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSInboundOptions) (adapter.Inbound, error) {
@@ -177,6 +179,10 @@ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		user = F.ToString(userIndex)
 	} else {
 		metadata.User = user
+		h.userconns.Store(conn, user)
+		onClose = N.AppendClose(onClose, func(err error) {
+			h.userconns.Delete(conn)
+		})
 	}
 	h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
