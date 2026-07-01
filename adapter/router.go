@@ -28,6 +28,8 @@ type Router interface {
 	NeedFindProcess() bool
 	AppendTracker(tracker ConnectionTracker)
 	ResetNetwork()
+	//for v2bx
+	GetCtx() context.Context
 }
 
 type ConnectionTracker interface {
