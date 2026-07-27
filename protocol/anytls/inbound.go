@@ -16,6 +16,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
+	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -149,18 +150,37 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 }
 
 // fallbackConnection hands a connection that failed authentication to the
-// configured local site, so the port answers like the host its certificate
-// names instead of closing. Routed through the normal connection router (the
-// same path the trojan inbound uses) so the destination is dialled by the
-// node's own outbound and shows up in the logs like any other connection.
+// configured site, so the port answers like the host its certificate names
+// instead of closing.
+//
+// Dialled directly rather than handed to the connection router, which is what
+// the trojan inbound does. The router would sniff the connection, and a
+// deployment with sniff_override_destination on — V2bX turns it on for every
+// inbound — rewrites the destination to the sniffed Host header. The fallback
+// target then becomes whatever hostname the prober asked for, on the fallback
+// port, which resolves to nothing and hangs: the exact symptom that made the
+// first build of this look like a no-op from outside. Routing would also drag
+// the connection through every route rule, so a "reject private destinations"
+// rule would silently kill a loopback decoy.
+//
+// A local, fixed, operator-configured address needs none of that machinery.
 func (h *Inbound) fallbackConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	metadata.Inbound = h.Tag()
-	metadata.InboundType = h.Type()
-	metadata.Destination = h.fallbackAddr
-	// Debug, not Info: on a probed node this fires as often as the probes
-	// arrive, and it is not news once the fallback is deliberately configured.
-	h.logger.DebugContext(ctx, "fallback connection to ", h.fallbackAddr)
-	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
+	h.logger.DebugContext(ctx, "fallback connection from ", metadata.Source, " to ", h.fallbackAddr)
+	var dialer net.Dialer
+	serverConn, err := dialer.DialContext(ctx, N.NetworkTCP, h.fallbackAddr.String())
+	if err != nil {
+		// Losing the disguise is bad; failing loudly is worse, so this closes
+		// the way it did before the fallback existed rather than hanging.
+		h.logger.ErrorContext(ctx, E.Cause(err, "fallback dial to ", h.fallbackAddr))
+		N.CloseOnHandshakeFailure(conn, onClose, err)
+		return
+	}
+	if err := bufio.CopyConn(ctx, conn, serverConn); err != nil {
+		h.logger.DebugContext(ctx, E.Cause(err, "fallback connection closed"))
+	}
+	if onClose != nil {
+		onClose(nil)
+	}
 }
 
 type inboundHandler Inbound
