@@ -31,13 +31,14 @@ func RegisterInbound(registry *inbound.Registry) {
 
 type Inbound struct {
 	inbound.Adapter
-	tlsConfig tls.ServerConfig
-	router    adapter.ConnectionRouterEx
-	logger    logger.ContextLogger
-	listener  *listener.Listener
-	service   *anytls.Service
-	userconns sync.Map
-	uuidlist  []string
+	tlsConfig    tls.ServerConfig
+	router       adapter.ConnectionRouterEx
+	logger       logger.ContextLogger
+	listener     *listener.Listener
+	service      *anytls.Service
+	userconns    sync.Map
+	uuidlist     []string
+	fallbackAddr M.Socksaddr
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AnyTLSInboundOptions) (adapter.Inbound, error) {
@@ -60,13 +61,34 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		paddingScheme = []byte(strings.Join(options.PaddingScheme, "\n"))
 	}
 
+	// sing-anytls has always accepted a fallback handler; upstream sing-box
+	// simply never passed one, so every unauthenticated connection ended in
+	// "fallback disabled" and an immediate close. That is a fingerprint: an
+	// active prober completes the TLS handshake, sends an ordinary HTTP
+	// request, and learns that whatever is here is not a web server. Handing
+	// those connections to a local site instead makes the answer boring.
+	//
+	// It works because the library rewinds before falling back: it wraps the
+	// connection with bufio.NewCachedConn and calls b.Resize(0, n) on failure,
+	// so the fallback target receives the client's bytes from the first one —
+	// a complete request, not a truncated one.
+	var fallbackHandler N.TCPConnectionHandlerEx
+	if options.Fallback != nil && options.Fallback.Server != "" {
+		inbound.fallbackAddr = options.Fallback.Build()
+		if !inbound.fallbackAddr.IsValid() {
+			return nil, E.New("invalid fallback address: ", inbound.fallbackAddr)
+		}
+		fallbackHandler = adapter.NewUpstreamContextHandlerEx(inbound.fallbackConnection, nil)
+	}
+
 	service, err := anytls.NewService(anytls.ServiceConfig{
 		Users: common.Map(options.Users, func(it option.AnyTLSUser) anytls.User {
 			return (anytls.User)(it)
 		}),
-		PaddingScheme: paddingScheme,
-		Handler:       (*inboundHandler)(inbound),
-		Logger:        logger,
+		PaddingScheme:   paddingScheme,
+		Handler:         (*inboundHandler)(inbound),
+		FallbackHandler: fallbackHandler,
+		Logger:          logger,
 	})
 	if err != nil {
 		return nil, err
@@ -124,6 +146,21 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
 	}
+}
+
+// fallbackConnection hands a connection that failed authentication to the
+// configured local site, so the port answers like the host its certificate
+// names instead of closing. Routed through the normal connection router (the
+// same path the trojan inbound uses) so the destination is dialled by the
+// node's own outbound and shows up in the logs like any other connection.
+func (h *Inbound) fallbackConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	metadata.Inbound = h.Tag()
+	metadata.InboundType = h.Type()
+	metadata.Destination = h.fallbackAddr
+	// Debug, not Info: on a probed node this fires as often as the probes
+	// arrive, and it is not news once the fallback is deliberately configured.
+	h.logger.DebugContext(ctx, "fallback connection to ", h.fallbackAddr)
+	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
 type inboundHandler Inbound
