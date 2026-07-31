@@ -5,7 +5,11 @@ import (
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"time"
 )
+
+// How long a peer gets to produce a header before we stop waiting for one.
+const proxyHeaderTimeout = 5 * time.Second
 
 // HAProxy PROXY protocol v2, enough of it to recover the real client address of
 // a connection that reached us through a local relay.
@@ -100,6 +104,14 @@ func readProxyHeader(conn net.Conn) net.Conn {
 	// well-formed header never spills into a second fill.
 	reader := bufio.NewReaderSize(conn, proxyV2HeaderLen+36)
 	wrapped := &proxyProtoConn{Conn: conn, reader: reader}
+
+	// A relay writes the header the instant it dials, so waiting seconds for one
+	// only ever means it is not coming. Without this bound a peer that connects
+	// and stays silent pins a goroutine and its socket for as long as it likes,
+	// which is a free way to exhaust the node. The deadline is cleared again
+	// below so the protocol above gets a connection with no surprise timeout.
+	_ = conn.SetReadDeadline(time.Now().Add(proxyHeaderTimeout))
+	defer conn.SetReadDeadline(time.Time{})
 
 	head, err := reader.Peek(proxyV2HeaderLen)
 	if err != nil || [12]byte(head[:12]) != proxyV2Signature {
