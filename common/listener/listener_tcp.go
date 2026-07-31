@@ -21,10 +21,20 @@ import (
 )
 
 func (l *Listener) ListenTCP() (net.Listener, error) {
-	//nolint:staticcheck
-	if l.listenOptions.ProxyProtocol || l.listenOptions.ProxyProtocolAcceptNoHeader {
-		return nil, E.New("Proxy Protocol is deprecated and removed in sing-box 1.6.0")
-	}
+	// Upstream returns an error here ("Proxy Protocol is deprecated and removed
+	// in sing-box 1.6.0"), which is right for an internet-facing listener: a
+	// PROXY header is an unauthenticated claim about who the client is.
+	//
+	// This fork accepts it, because a node behind our Iran relay has no other
+	// way to know its users apart - the relay terminates the user's connection
+	// and dials the inbound over loopback, so every tunnelled user arrives as
+	// 127.0.0.1 and is invisible to device counting and to the online list.
+	// see proxyproto.go: the header is believed ONLY from a loopback peer, so a
+	// direct connection from the internet can never assert a source address.
+	//
+	// Note the failure mode being avoided: setting the option used to take the
+	// inbound DOWN rather than degrade it, because this error is returned before
+	// the socket is ever bound.
 	var err error
 	bindAddr := M.SocksaddrFrom(l.listenOptions.Listen.Build(netip.AddrFrom4([4]byte{127, 0, 0, 1})), l.listenOptions.ListenPort)
 	var listenConfig net.ListenConfig
@@ -101,6 +111,13 @@ func (l *Listener) loopTCPIn() {
 			continue
 		}
 		//nolint:staticcheck
+		// Recover the real client address before anything reads the source, so
+		// routing, the traffic hooks and device counting all see the user rather
+		// than the relay. Doing it here rather than per-protocol is what keeps
+		// every inbound working without knowing a relay exists.
+		if l.listenOptions.ProxyProtocol || l.listenOptions.ProxyProtocolAcceptNoHeader {
+			conn = readProxyHeader(conn)
+		}
 		metadata.InboundDetour = l.listenOptions.Detour
 		metadata.Source = M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
 		metadata.OriginDestination = M.SocksaddrFromNet(conn.LocalAddr()).Unwrap()
