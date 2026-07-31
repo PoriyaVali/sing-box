@@ -110,18 +110,35 @@ func (l *Listener) loopTCPIn() {
 			l.logger.Error("tcp listener closed: ", err)
 			continue
 		}
+		ctx := log.ContextWithNewID(l.ctx)
 		//nolint:staticcheck
-		// Recover the real client address before anything reads the source, so
-		// routing, the traffic hooks and device counting all see the user rather
-		// than the relay. Doing it here rather than per-protocol is what keeps
-		// every inbound working without knowing a relay exists.
+		// Recovering the real client address means READING from the connection,
+		// and reading must never happen on this loop: a peer that connects and
+		// sends nothing - the relay's own watchdog probe, a port scanner, a
+		// half-open connection - would block the accept, and while it blocks the
+		// listener serves NOBODY. That is a whole inbound taken down by one idle
+		// socket, and it is invisible in the node's log because nothing errors;
+		// connections simply stop being answered.
+		//
+		// So the sniff happens in the per-connection goroutine, where a stall
+		// costs only that connection. Nothing else is reordered: the handler
+		// already ran in a goroutine, and metadata is built inside it because
+		// the source is not known until the header has been read.
 		if l.listenOptions.ProxyProtocol || l.listenOptions.ProxyProtocolAcceptNoHeader {
-			conn = readProxyHeader(conn)
+			go func(conn net.Conn) {
+				conn = readProxyHeader(conn)
+				var md adapter.InboundContext
+				md.InboundDetour = l.listenOptions.Detour
+				md.Source = M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
+				md.OriginDestination = M.SocksaddrFromNet(conn.LocalAddr()).Unwrap()
+				l.logger.InfoContext(ctx, "inbound connection from ", md.Source)
+				l.connHandler.NewConnectionEx(ctx, conn, md, nil)
+			}(conn)
+			continue
 		}
 		metadata.InboundDetour = l.listenOptions.Detour
 		metadata.Source = M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
 		metadata.OriginDestination = M.SocksaddrFromNet(conn.LocalAddr()).Unwrap()
-		ctx := log.ContextWithNewID(l.ctx)
 		l.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
 		go l.connHandler.NewConnectionEx(ctx, conn, metadata, nil)
 	}
