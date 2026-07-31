@@ -64,9 +64,20 @@ func (c *proxyProtoConn) RemoteAddr() net.Addr {
 	return c.Conn.RemoteAddr()
 }
 
-// Upstream lets sing's copy paths reach the raw connection for writes while
-// reads still come through the buffer above.
-func (c *proxyProtoConn) Upstream() any { return c.Conn }
+// 🔴 Deliberately NO Upstream() method.
+//
+// Declaring one is the obvious optimisation and it silently breaks the
+// connection: sing's copy paths treat an upstream as "you may read the
+// underlying conn directly", so they bypass the buffered reader above. Sniffing
+// the header necessarily reads ahead - bufio pulls in whatever arrived with it,
+// which is the start of the client's TLS ClientHello - and those bytes live only
+// in that buffer. Handing out the raw conn throws them away, so the handshake
+// receives a stream missing its first bytes and fails, while a direct connection
+// (never wrapped, because its peer is not loopback) keeps working. That
+// asymmetry is exactly how it presented: fine directly, broken through the relay.
+//
+// Without the method sing wraps this like any other net.Conn and every read goes
+// through the buffer, which is what correctness requires here.
 
 // peerIsLoopback reports whether the connection's actual peer is on this
 // machine - the only case in which a PROXY header may be believed.

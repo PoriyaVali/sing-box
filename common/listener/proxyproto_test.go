@@ -156,3 +156,37 @@ func TestTruncatedHeaderIsLeftAlone(t *testing.T) {
 		t.Error("a truncated header was partially consumed")
 	}
 }
+
+// 🔴 Regression: the wrapper must not expose the raw connection.
+//
+// Declaring Upstream() let sing's copy paths read the underlying conn directly,
+// bypassing the buffer that necessarily holds the bytes read ahead while
+// sniffing the header - the start of the client's ClientHello. Those bytes were
+// dropped and the handshake failed, but ONLY through the relay: a direct
+// connection is never wrapped, so it kept working, which is what made the
+// breakage look like a tunnel problem rather than a parser problem.
+func TestWrapperDoesNotExposeTheRawConn(t *testing.T) {
+	client := netip.MustParseAddr("5.127.1.1")
+	// A payload big enough that sniffing reads ahead into it.
+	body := bytes.Repeat([]byte("HANDSHAKE"), 40)
+	payload := append(v2Header(proxyFamilyINET, client, 1234, proxyCmdProxy), body...)
+	out := readProxyHeader(mkConn("127.0.0.1:40000", payload))
+
+	if _, bad := out.(interface{ Upstream() any }); bad {
+		t.Fatal("the wrapper exposes Upstream(); sing will bypass the buffer and drop the read-ahead bytes")
+	}
+
+	// Everything after the header must survive, byte for byte.
+	got := make([]byte, 0, len(body))
+	buf := make([]byte, 7) // small reads, so the buffer is genuinely exercised
+	for len(got) < len(body) {
+		n, err := out.Read(buf)
+		got = append(got, buf[:n]...)
+		if err != nil {
+			break
+		}
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("payload after the header was corrupted: got %d of %d bytes", len(got), len(body))
+	}
+}
