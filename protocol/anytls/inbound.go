@@ -139,9 +139,15 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		conn = tlsConn
 	}
 	h.userconns.Store(conn, metadata.User)
-	onClose = N.AppendClose(onClose, func(err error) {
-		h.userconns.Delete(conn)
-	})
+	// service.NewConnection runs the whole session and returns only when it is
+	// over, so this is the one exit every session takes. The entry used to be
+	// removed from the onClose passed down - but sing-anytls hands that onClose
+	// to each STREAM, never to the session. A session that ended without ever
+	// opening a stream (a device dropping right after the handshake, all the
+	// time on mobile networks) never called it, and its entry, holding the TLS
+	// connection and its buffers, stayed until the process restarted: a node's
+	// memory grew with uptime.
+	defer h.userconns.Delete(conn)
 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
