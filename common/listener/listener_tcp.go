@@ -47,6 +47,10 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 	if l.listenOptions.ReuseAddr {
 		listenConfig.Control = control.Append(listenConfig.Control, control.ReuseAddr())
 	}
+	if l.listenOptions.TCPCongestion != "" {
+		// Set on the listening socket; every accepted connection inherits it.
+		listenConfig.Control = control.Append(listenConfig.Control, congestionControl(l.listenOptions.TCPCongestion, l.logger))
+	}
 	if l.listenOptions.DisableTCPKeepAlive {
 		listenConfig.KeepAlive = -1
 		listenConfig.KeepAliveConfig.Enable = false

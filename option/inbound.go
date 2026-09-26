@@ -75,6 +75,10 @@ type ListenOptions struct {
 	TCPKeepAliveInterval badoption.Duration `json:"tcp_keep_alive_interval,omitempty"`
 	TCPFastOpen          bool               `json:"tcp_fast_open,omitempty"`
 	TCPMultiPath         bool               `json:"tcp_multi_path,omitempty"`
+	// TCPCongestion picks the congestion control for this listener's
+	// connections only (e.g. "bbr"), leaving the system default alone. If the
+	// kernel cannot provide it the listener still starts, on the default.
+	TCPCongestion string `json:"tcp_congestion,omitempty"`
 	UDPFragment          *bool              `json:"udp_fragment,omitempty"`
 	UDPFragmentDefault   bool               `json:"-"`
 	UDPTimeout           UDPTimeoutCompat   `json:"udp_timeout,omitempty"`
