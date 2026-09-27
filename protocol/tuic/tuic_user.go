@@ -9,6 +9,8 @@ import (
 )
 
 func (h *Inbound) AddUsers(users []option.TUICUser, ids []int) error {
+	h.usersAccess.Lock()
+	defer h.usersAccess.Unlock()
 	for i, user := range users {
 		h.userNameList = append(h.userNameList, user.Name)
 		h.uuidToUid[user.UUID] = ids[i]
@@ -28,6 +30,8 @@ func (h *Inbound) AddUsers(users []option.TUICUser, ids []int) error {
 	return nil
 }
 func (h *Inbound) DelUsers(names []string) error {
+	h.usersAccess.Lock()
+	defer h.usersAccess.Unlock()
 	if len(names) == 0 {
 		return nil
 	}

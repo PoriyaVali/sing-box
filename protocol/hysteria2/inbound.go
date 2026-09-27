@@ -37,9 +37,13 @@ type Inbound struct {
 	tlsConfig    tls.ServerConfig
 	service      *hysteria2.Service[int]
 	userNameList []string
-	uidToUuid    map[int]string
-	uuidToUid    map[string]int
-	userconns    sync.Map
+	// usersAccess guards userNameList, uidToUuid and uuidToUid: users change
+	// on the panel's schedule while connections look themselves up, and a map
+	// read during a write is a fatal error in Go.
+	usersAccess sync.RWMutex
+	uidToUuid   map[int]string
+	uuidToUid   map[string]int
+	userconns   sync.Map
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2InboundOptions) (adapter.Inbound, error) {
@@ -163,7 +167,7 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
 	userID, _ := auth.UserFromContext[int](ctx)
-	if userName, found := h.uidToUuid[userID]; found {
+	if userName, found := h.userName(userID); found {
 		if userName != "" {
 			metadata.User = userName
 			h.userconns.LoadOrStore(conn, userName)
@@ -195,7 +199,7 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
 	userID, _ := auth.UserFromContext[int](ctx)
-	if userName, found := h.uidToUuid[userID]; found {
+	if userName, found := h.userName(userID); found {
 		if userName != "" {
 			metadata.User = userName
 			h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
@@ -233,4 +237,12 @@ func (h *Inbound) Close() error {
 		h.tlsConfig,
 		common.PtrOrNil(h.service),
 	)
+}
+
+// userName resolves an authenticated user ID; safe while users change.
+func (h *Inbound) userName(id int) (string, bool) {
+	h.usersAccess.RLock()
+	defer h.usersAccess.RUnlock()
+	name, found := h.uidToUuid[id]
+	return name, found
 }

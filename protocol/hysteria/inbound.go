@@ -3,12 +3,14 @@ package hysteria
 import (
 	"context"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/common/userlist"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -25,12 +27,13 @@ func RegisterInbound(registry *inbound.Registry) {
 
 type Inbound struct {
 	inbound.Adapter
-	router       adapter.Router
-	logger       log.ContextLogger
-	listener     *listener.Listener
-	tlsConfig    tls.ServerConfig
-	service      *hysteria.Service[int]
-	userNameList []string
+	router      adapter.Router
+	logger      log.ContextLogger
+	listener    *listener.Listener
+	tlsConfig   tls.ServerConfig
+	service     *hysteria.Service[int]
+	users       *userlist.List[option.HysteriaUser]
+	usersUpdate sync.Mutex // serialises changes to users and the service
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.HysteriaInboundOptions) (adapter.Inbound, error) {
@@ -90,23 +93,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, err
 	}
-	userList := make([]int, 0, len(options.Users))
-	userNameList := make([]string, 0, len(options.Users))
-	userPasswordList := make([]string, 0, len(options.Users))
-	for index, user := range options.Users {
-		userList = append(userList, index)
-		userNameList = append(userNameList, user.Name)
-		var password string
-		if user.AuthString != "" {
-			password = user.AuthString
-		} else {
-			password = string(user.Auth)
-		}
-		userPasswordList = append(userPasswordList, password)
-	}
-	service.UpdateUsers(userList, userPasswordList)
 	inbound.service = service
-	inbound.userNameList = userNameList
+	inbound.users = userlist.New[option.HysteriaUser]()
+	inbound.users.Add(options.Users, hysteriaUserName)
+	inbound.syncUsersLocked()
 	return inbound, nil
 }
 
@@ -123,7 +113,14 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
 	userID, _ := auth.UserFromContext[int](ctx)
-	if userName := h.userNameList[userID]; userName != "" {
+	userName, listed := h.users.Name(userID)
+	if !listed {
+		// Removed after authenticating.
+		h.logger.WarnContext(ctx, "no valid user: ", userID)
+		conn.Close()
+		return
+	}
+	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
 	} else {
@@ -145,7 +142,14 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
 	userID, _ := auth.UserFromContext[int](ctx)
-	if userName := h.userNameList[userID]; userName != "" {
+	userName, listed := h.users.Name(userID)
+	if !listed {
+		// Removed after authenticating.
+		h.logger.WarnContext(ctx, "no valid user: ", userID)
+		conn.Close()
+		return
+	}
+	if userName != "" {
 		metadata.User = userName
 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
 	} else {

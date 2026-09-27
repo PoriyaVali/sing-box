@@ -4,26 +4,32 @@ import (
 	"net"
 
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common"
 )
 
+func vlessUserName(u option.VLESSUser) string { return u.Name }
+
+// syncUsersLocked hands the service the current users under their stable
+// IDs. Callers hold usersUpdate (or own the inbound, during construction).
+func (h *Inbound) syncUsersLocked() {
+	ids, users := h.users.Snapshot()
+	uuids := make([]string, len(users))
+	flows := make([]string, len(users))
+	for i, u := range users {
+		uuids[i] = u.UUID
+		flows[i] = u.Flow
+	}
+	h.service.UpdateUsers(ids, uuids, flows)
+}
+
 func (h *Inbound) AddUsers(users []option.VLESSUser) error {
-	h.users = append(h.users, users...)
-	h.service.UpdateUsers(
-		common.MapIndexed(h.users, func(index int, it option.VLESSUser) int {
-			return index
-		}),
-		common.Map(h.users, func(it option.VLESSUser) string {
-			return it.UUID
-		}),
-		common.Map(h.users, func(it option.VLESSUser) string {
-			return it.Flow
-		}),
-	)
+	h.usersUpdate.Lock()
+	defer h.usersUpdate.Unlock()
+	h.users.Add(users, vlessUserName)
+	h.syncUsersLocked()
 	return nil
 }
+
 func (h *Inbound) DelUsers(names []string) error {
-	toDelete := make(map[string]struct{})
 	for _, name := range names {
 		h.userconns.Range(func(key, value interface{}) bool {
 			if value.(string) == name {
@@ -32,25 +38,10 @@ func (h *Inbound) DelUsers(names []string) error {
 			}
 			return true
 		})
-		toDelete[name] = struct{}{}
 	}
-	remaining := make([]option.VLESSUser, 0)
-	for _, user := range h.users {
-		if _, found := toDelete[user.Name]; !found {
-			remaining = append(remaining, user)
-		}
-	}
-	h.users = remaining
-	h.service.UpdateUsers(
-		common.MapIndexed(h.users, func(index int, it option.VLESSUser) int {
-			return index
-		}),
-		common.Map(h.users, func(it option.VLESSUser) string {
-			return it.UUID
-		}),
-		common.Map(h.users, func(it option.VLESSUser) string {
-			return it.Flow
-		}),
-	)
+	h.usersUpdate.Lock()
+	defer h.usersUpdate.Unlock()
+	h.users.Delete(names)
+	h.syncUsersLocked()
 	return nil
 }

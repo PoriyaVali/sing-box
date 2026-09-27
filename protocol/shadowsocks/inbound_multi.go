@@ -4,18 +4,20 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/mux"
+	"github.com/sagernet/sing-box/common/shadowaead"
 	"github.com/sagernet/sing-box/common/uot"
+	"github.com/sagernet/sing-box/common/userlist"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-shadowsocks"
-	"github.com/sagernet/sing-shadowsocks/shadowaead"
 	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
@@ -40,8 +42,10 @@ type MultiInbound struct {
 	logger   logger.ContextLogger
 	listener *listener.Listener
 	service  shadowsocks.MultiService[int]
-	users    []option.ShadowsocksUser
-	tracker  adapter.SSMTracker
+	users    *userlist.List[option.ShadowsocksUser]
+	// usersUpdate serialises changes to users and the service.
+	usersUpdate sync.Mutex
+	tracker     adapter.SSMTracker
 }
 
 func newMultiInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowsocksInboundOptions) (*MultiInbound, error) {
@@ -50,6 +54,7 @@ func newMultiInbound(ctx context.Context, router adapter.Router, logger log.Cont
 		ctx:     ctx,
 		router:  uot.NewRouter(router, logger),
 		logger:  logger,
+		users:   userlist.New[option.ShadowsocksUser](),
 	}
 	var err error
 	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
@@ -83,18 +88,13 @@ func newMultiInbound(ctx context.Context, router adapter.Router, logger log.Cont
 	if err != nil {
 		return nil, err
 	}
+	inbound.service = service
 	if len(options.Users) > 0 {
-		err = service.UpdateUsersWithPasswords(common.MapIndexed(options.Users, func(index int, user option.ShadowsocksUser) int {
-			return index
-		}), common.Map(options.Users, func(user option.ShadowsocksUser) string {
-			return user.Password
-		}))
-		if err != nil {
+		inbound.users.Add(options.Users, shadowsocksUserName)
+		if err = inbound.syncUsersLocked(); err != nil {
 			return nil, err
 		}
 	}
-	inbound.service = service
-	inbound.users = options.Users
 	inbound.listener = listener.New(listener.Options{
 		Context:                  ctx,
 		Logger:                   logger,
@@ -123,18 +123,14 @@ func (h *MultiInbound) SetTracker(tracker adapter.SSMTracker) {
 }
 
 func (h *MultiInbound) UpdateUsers(users []string, uPSKs []string) error {
-	err := h.service.UpdateUsersWithPasswords(common.MapIndexed(users, func(index int, user string) int {
-		return index
-	}), uPSKs)
-	if err != nil {
-		return err
+	list := make([]option.ShadowsocksUser, len(users))
+	for i := range users {
+		list[i] = option.ShadowsocksUser{Name: users[i], Password: uPSKs[i]}
 	}
-	h.users = common.Map(users, func(user string) option.ShadowsocksUser {
-		return option.ShadowsocksUser{
-			Name: user,
-		}
-	})
-	return nil
+	h.usersUpdate.Lock()
+	defer h.usersUpdate.Unlock()
+	h.users.Replace(list, shadowsocksUserName)
+	return h.syncUsersLocked()
 }
 
 //nolint:staticcheck
@@ -163,7 +159,11 @@ func (h *MultiInbound) newConnection(ctx context.Context, conn net.Conn, metadat
 	if !loaded {
 		return os.ErrInvalid
 	}
-	user := h.users[userIndex].Name
+	user, listed := h.users.Name(userIndex)
+	if !listed {
+		// Removed between the handshake and here.
+		return E.New("user removed")
+	}
 	if user == "" {
 		user = F.ToString(userIndex)
 	} else {
@@ -186,7 +186,11 @@ func (h *MultiInbound) newPacketConnection(ctx context.Context, conn N.PacketCon
 	if !loaded {
 		return os.ErrInvalid
 	}
-	user := h.users[userIndex].Name
+	user, listed := h.users.Name(userIndex)
+	if !listed {
+		// Removed between the handshake and here.
+		return E.New("user removed")
+	}
 	if user == "" {
 		user = F.ToString(userIndex)
 	} else {

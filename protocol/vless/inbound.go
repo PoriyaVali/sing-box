@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/common/mux"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/uot"
+	"github.com/sagernet/sing-box/common/userlist"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -37,15 +38,17 @@ var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
 
 type Inbound struct {
 	inbound.Adapter
-	ctx       context.Context
-	router    adapter.ConnectionRouterEx
-	logger    logger.ContextLogger
-	listener  *listener.Listener
-	users     []option.VLESSUser
-	service   *vless.Service[int]
-	tlsConfig tls.ServerConfig
-	transport adapter.V2RayServerTransport
-	userconns sync.Map
+	ctx      context.Context
+	router   adapter.ConnectionRouterEx
+	logger   logger.ContextLogger
+	listener *listener.Listener
+	users    *userlist.List[option.VLESSUser]
+	// usersUpdate serialises changes to users and the service.
+	usersUpdate sync.Mutex
+	service     *vless.Service[int]
+	tlsConfig   tls.ServerConfig
+	transport   adapter.V2RayServerTransport
+	userconns   sync.Map
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSInboundOptions) (adapter.Inbound, error) {
@@ -54,7 +57,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		ctx:     ctx,
 		router:  uot.NewRouter(router, logger),
 		logger:  logger,
-		users:   options.Users,
+		users:   userlist.New[option.VLESSUser](),
 	}
 	var err error
 	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
@@ -62,14 +65,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		return nil, err
 	}
 	service := vless.NewService[int](logger, adapter.NewUpstreamContextHandlerEx(inbound.newConnectionEx, inbound.newPacketConnectionEx))
-	service.UpdateUsers(common.MapIndexed(inbound.users, func(index int, _ option.VLESSUser) int {
-		return index
-	}), common.Map(inbound.users, func(it option.VLESSUser) string {
-		return it.UUID
-	}), common.Map(inbound.users, func(it option.VLESSUser) string {
-		return it.Flow
-	}))
 	inbound.service = service
+	inbound.users.Add(options.Users, vlessUserName)
+	inbound.syncUsersLocked()
 	if options.TLS != nil {
 		inbound.tlsConfig, err = tls.NewServerWithOptions(tls.ServerOptions{
 			Context: ctx,
@@ -182,7 +180,12 @@ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	user, listed := h.users.Name(userIndex)
+	if !listed {
+		// Removed between the handshake and here.
+		N.CloseOnHandshakeFailure(conn, onClose, E.New("user removed"))
+		return
+	}
 	if user == "" {
 		user = F.ToString(userIndex)
 	} else {
@@ -200,7 +203,12 @@ func (h *Inbound) newPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	user, listed := h.users.Name(userIndex)
+	if !listed {
+		// Removed between the handshake and here.
+		N.CloseOnHandshakeFailure(conn, onClose, E.New("user removed"))
+		return
+	}
 	if user == "" {
 		user = F.ToString(userIndex)
 	} else {

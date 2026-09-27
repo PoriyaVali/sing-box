@@ -11,6 +11,7 @@ import (
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/mux"
 	"github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/common/userlist"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -32,11 +33,13 @@ var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
 
 type Inbound struct {
 	inbound.Adapter
-	router                   adapter.ConnectionRouterEx
-	logger                   log.ContextLogger
-	listener                 *listener.Listener
-	service                  *trojan.Service[int]
-	users                    []option.TrojanUser
+	router   adapter.ConnectionRouterEx
+	logger   log.ContextLogger
+	listener *listener.Listener
+	service  *trojan.Service[int]
+	users    *userlist.List[option.TrojanUser]
+	// usersUpdate serialises changes to users and the service.
+	usersUpdate              sync.Mutex
 	tlsConfig                tls.ServerConfig
 	fallbackAddr             M.Socksaddr
 	fallbackAddrTLSNextProto map[string]M.Socksaddr
@@ -49,7 +52,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		Adapter: inbound.NewAdapter(C.TypeTrojan, tag),
 		router:  router,
 		logger:  logger,
-		users:   options.Users,
+		users:   userlist.New[option.TrojanUser](),
 	}
 	if options.TLS != nil {
 		tlsConfig, err := tls.NewServerWithOptions(tls.ServerOptions{
@@ -89,11 +92,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		fallbackHandler = adapter.NewUpstreamContextHandlerEx(inbound.fallbackConnection, nil)
 	}
 	service := trojan.NewService[int](adapter.NewUpstreamContextHandlerEx(inbound.newConnection, inbound.newPacketConnection), fallbackHandler, logger)
-	err := service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.TrojanUser) int {
-		return index
-	}), common.Map(options.Users, func(it option.TrojanUser) string {
-		return it.Password
-	}))
+	inbound.service = service
+	inbound.users.Add(options.Users, trojanUserName)
+	err := inbound.syncUsersLocked()
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +197,12 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	user, listed := h.users.Name(userIndex)
+	if !listed {
+		// Removed between the handshake and here.
+		N.CloseOnHandshakeFailure(conn, onClose, E.New("user removed"))
+		return
+	}
 	if user == "" {
 		user = F.ToString(userIndex)
 	} else {
@@ -214,7 +220,12 @@ func (h *Inbound) newPacketConnection(ctx context.Context, conn N.PacketConn, me
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	user, listed := h.users.Name(userIndex)
+	if !listed {
+		// Removed between the handshake and here.
+		N.CloseOnHandshakeFailure(conn, onClose, E.New("user removed"))
+		return
+	}
 	if user == "" {
 		user = F.ToString(userIndex)
 	} else {

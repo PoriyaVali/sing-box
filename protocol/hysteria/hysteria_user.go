@@ -2,36 +2,41 @@ package hysteria
 
 import "github.com/sagernet/sing-box/option"
 
+func hysteriaUserName(u option.HysteriaUser) string { return u.Name }
+
+func hysteriaPassword(u option.HysteriaUser) string {
+	if u.AuthString != "" {
+		return u.AuthString
+	}
+	return string(u.Auth)
+}
+
+// syncUsersLocked hands the service the current users under their stable
+// IDs. Callers hold usersUpdate (or own the inbound, during construction).
+func (h *Inbound) syncUsersLocked() {
+	ids, users := h.users.Snapshot()
+	passwords := make([]string, len(users))
+	for i, u := range users {
+		passwords[i] = hysteriaPassword(u)
+	}
+	h.service.UpdateUsers(ids, passwords)
+}
+
 func (h *Inbound) AddUsers(users []option.HysteriaUser) error {
-	for _, user := range users {
-		h.userNameList = append(h.userNameList, user.AuthString)
-	}
-	indexs := make([]int, len(h.userNameList))
-	for i := range h.userNameList {
-		indexs[i] = i
-	}
-	h.service.UpdateUsers(indexs, h.userNameList)
+	h.usersUpdate.Lock()
+	defer h.usersUpdate.Unlock()
+	h.users.Add(users, hysteriaUserName)
+	h.syncUsersLocked()
 	return nil
 }
+
 func (h *Inbound) DelUsers(names []string) error {
 	if len(names) == 0 {
 		return nil
 	}
-	toDelete := make(map[string]struct{})
-	for _, name := range names {
-		toDelete[name] = struct{}{}
-	}
-	remaining := make([]string, 0, len(h.userNameList))
-	for _, user := range h.userNameList {
-		if _, found := toDelete[user]; !found {
-			remaining = append(remaining, user)
-		}
-	}
-	h.userNameList = remaining
-	indexs := make([]int, len(h.userNameList))
-	for i := range h.userNameList {
-		indexs[i] = i
-	}
-	h.service.UpdateUsers(indexs, h.userNameList)
+	h.usersUpdate.Lock()
+	defer h.usersUpdate.Unlock()
+	h.users.Delete(names)
+	h.syncUsersLocked()
 	return nil
 }

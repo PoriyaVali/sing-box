@@ -114,6 +114,9 @@ func (l *Listener) loopTCPIn() {
 			l.logger.Error("tcp listener closed: ", err)
 			continue
 		}
+		if l.listenOptions.TCPNotSentLowat > 0 {
+			setNotSentLowat(conn, l.listenOptions.TCPNotSentLowat, l.logger)
+		}
 		ctx := log.ContextWithNewID(l.ctx)
 		//nolint:staticcheck
 		// Recovering the real client address means READING from the connection,

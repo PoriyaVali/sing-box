@@ -2,34 +2,31 @@ package shadowsocks
 
 import (
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common"
 )
 
-func (h *MultiInbound) AddUsers(users []option.ShadowsocksUser) error {
-	h.users = append(h.users, users...)
-	err := h.service.UpdateUsersWithPasswords(common.MapIndexed(h.users, func(index int, user option.ShadowsocksUser) int {
-		return index
-	}), common.Map(h.users, func(user option.ShadowsocksUser) string {
-		return user.Password
-	}))
-	return err
+func shadowsocksUserName(u option.ShadowsocksUser) string { return u.Name }
+
+// syncUsersLocked hands the service the current users under their stable
+// IDs. Callers hold usersUpdate (or own the inbound, during construction).
+func (h *MultiInbound) syncUsersLocked() error {
+	ids, users := h.users.Snapshot()
+	passwords := make([]string, len(users))
+	for i, u := range users {
+		passwords[i] = u.Password
+	}
+	return h.service.UpdateUsersWithPasswords(ids, passwords)
 }
+
+func (h *MultiInbound) AddUsers(users []option.ShadowsocksUser) error {
+	h.usersUpdate.Lock()
+	defer h.usersUpdate.Unlock()
+	h.users.Add(users, shadowsocksUserName)
+	return h.syncUsersLocked()
+}
+
 func (h *MultiInbound) DelUsers(names []string) error {
-	toDelete := make(map[string]struct{})
-	for _, name := range names {
-		toDelete[name] = struct{}{}
-	}
-	remaining := make([]option.ShadowsocksUser, 0, len(h.users))
-	for _, user := range h.users {
-		if _, found := toDelete[user.Name]; !found {
-			remaining = append(remaining, user)
-		}
-	}
-	h.users = remaining
-	err := h.service.UpdateUsersWithPasswords(common.MapIndexed(h.users, func(index int, user option.ShadowsocksUser) int {
-		return index
-	}), common.Map(h.users, func(user option.ShadowsocksUser) string {
-		return user.Password
-	}))
-	return err
+	h.usersUpdate.Lock()
+	defer h.usersUpdate.Unlock()
+	h.users.Delete(names)
+	return h.syncUsersLocked()
 }

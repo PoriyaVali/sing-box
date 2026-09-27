@@ -79,10 +79,16 @@ type ListenOptions struct {
 	// connections only (e.g. "bbr"), leaving the system default alone. If the
 	// kernel cannot provide it the listener still starts, on the default.
 	TCPCongestion string `json:"tcp_congestion,omitempty"`
-	UDPFragment          *bool              `json:"udp_fragment,omitempty"`
-	UDPFragmentDefault   bool               `json:"-"`
-	UDPTimeout           UDPTimeoutCompat   `json:"udp_timeout,omitempty"`
-	Detour               string             `json:"detour,omitempty"`
+	// TCPNotSentLowat caps the bytes each accepted connection may hold queued
+	// but unsent (TCP_NOTSENT_LOWAT), so a small reply is not stuck behind a
+	// download sharing the connection. Set per connection: a listener's value
+	// is not inherited, and accepted connections did not follow the sysctl on
+	// the kernel measured. 0 leaves the system default.
+	TCPNotSentLowat    int              `json:"tcp_notsent_lowat,omitempty"`
+	UDPFragment        *bool            `json:"udp_fragment,omitempty"`
+	UDPFragmentDefault bool             `json:"-"`
+	UDPTimeout         UDPTimeoutCompat `json:"udp_timeout,omitempty"`
+	Detour             string           `json:"detour,omitempty"`
 
 	// Deprecated: removed
 	ProxyProtocol bool `json:"proxy_protocol,omitempty"`
