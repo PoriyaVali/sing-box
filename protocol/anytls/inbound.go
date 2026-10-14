@@ -38,8 +38,23 @@ type Inbound struct {
 	listener     *listener.Listener
 	service      *anytls.Service
 	userconns    sync.Map
+	sessions     sync.Map
+	usersAccess  sync.RWMutex
+	users        map[string]*inboundUser
+	closed       bool
 	uuidlist     []string
 	fallbackAddr M.Socksaddr
+}
+
+type inboundUser struct {
+	option.AnyTLSUser
+}
+
+type sessionContextKey struct{}
+
+type inboundSession struct {
+	users map[string]*inboundUser
+	conn  net.Conn
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AnyTLSInboundOptions) (adapter.Inbound, error) {
@@ -47,6 +62,13 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		Adapter: inbound.NewAdapter(C.TypeAnyTLS, tag),
 		router:  uot.NewRouter(router, logger),
 		logger:  logger,
+		users:   make(map[string]*inboundUser, len(options.Users)),
+	}
+	for index, user := range options.Users {
+		if _, exists := inbound.users[user.Name]; exists {
+			return nil, E.New("duplicate name for AnyTLS user ", index)
+		}
+		inbound.users[user.Name] = &inboundUser{AnyTLSUser: user}
 	}
 
 	if options.TLS != nil && options.TLS.Enabled {
@@ -95,6 +117,14 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		return nil, err
 	}
 	inbound.service = service
+	// The V2bX-patched service exposes the physical session immediately after
+	// authentication. Keep source compatibility with the original module; its
+	// stream handler below performs the same admission check on first use.
+	if authenticated, ok := any(service).(interface {
+		SetAuthenticatedSessionHandler(func(context.Context, net.Conn) (func(), error))
+	}); ok {
+		authenticated.SetAuthenticatedSessionHandler(inbound.authenticatedSession)
+	}
 	inbound.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -125,10 +155,33 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 }
 
 func (h *Inbound) Close() error {
+	h.usersAccess.Lock()
+	h.closed = true
+	h.users = nil
+	var conns []net.Conn
+	h.sessions.Range(func(key, _ any) bool {
+		h.sessions.Delete(key)
+		conns = append(conns, key.(net.Conn))
+		return true
+	})
+	h.usersAccess.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
 	return common.Close(h.listener, h.tlsConfig)
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	h.usersAccess.RLock()
+	if h.closed {
+		h.usersAccess.RUnlock()
+		N.CloseOnHandshakeFailure(conn, onClose, net.ErrClosed)
+		return
+	}
+	session := &inboundSession{users: h.users}
+	h.sessions.Store(conn, struct{}{})
+	h.usersAccess.RUnlock()
+	defer h.sessions.Delete(conn)
 	if h.tlsConfig != nil {
 		tlsConn, err := tls.ServerHandshake(ctx, conn, h.tlsConfig)
 		if err != nil {
@@ -138,7 +191,8 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		}
 		conn = tlsConn
 	}
-	h.userconns.Store(conn, metadata.User)
+	session.conn = conn
+	ctx = context.WithValue(ctx, sessionContextKey{}, session)
 	// service.NewConnection runs the whole session and returns only when it is
 	// over, so this is the one exit every session takes. The entry used to be
 	// removed from the onClose passed down - but sing-anytls hands that onClose
@@ -153,6 +207,22 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
 	}
+}
+
+func (h *Inbound) authenticatedSession(ctx context.Context, _ net.Conn) (func(), error) {
+	session, ok := ctx.Value(sessionContextKey{}).(*inboundSession)
+	if !ok {
+		return nil, E.New("missing AnyTLS session context")
+	}
+	name, authenticated := auth.UserFromContext[string](ctx)
+	identity := session.users[name]
+	h.usersAccess.RLock()
+	defer h.usersAccess.RUnlock()
+	if !authenticated || identity == nil || h.closed || h.users[name] != identity {
+		return nil, E.New("AnyTLS user generation is no longer active")
+	}
+	h.userconns.Store(session.conn, identity)
+	return func() { h.userconns.Delete(session.conn) }, nil
 }
 
 // fallbackConnection hands a connection that failed authentication to the
@@ -192,6 +262,10 @@ func (h *Inbound) fallbackConnection(ctx context.Context, conn net.Conn, metadat
 type inboundHandler Inbound
 
 func (h *inboundHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	if _, err := (*Inbound)(h).authenticatedSession(ctx, nil); err != nil {
+		N.CloseOnHandshakeFailure(conn, onClose, err)
+		return
+	}
 	var metadata adapter.InboundContext
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()

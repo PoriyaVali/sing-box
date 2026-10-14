@@ -2,6 +2,7 @@ package tuic
 
 import (
 	"context"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -34,15 +35,21 @@ type Inbound struct {
 	logger       log.ContextLogger
 	listener     *listener.Listener
 	tlsConfig    tls.ServerConfig
-	server       *tuic.Service[int]
+	server       *tuic.Service[*inboundUser]
 	userNameList []string
-	// usersAccess guards userNameList, uidToUuid and uuidToUid: users change
-	// on the panel's schedule while connections look themselves up, and a map
-	// read during a write is a fatal error in Go.
+	// Membership validation and connection registration share this lock, so
+	// an authenticated session cannot register after its generation is removed.
 	usersAccess sync.RWMutex
-	uidToUuid   map[int]string
-	uuidToUid   map[string]int
+	users       map[string]*inboundUser
 	userconns   sync.Map
+	closed      bool
+}
+
+// The pointer identifies one authentication generation. Re-adding a UUID
+// creates a new identity; old authenticated QUIC sessions remain revoked.
+type inboundUser struct {
+	option.TUICUser
+	id int
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TUICInboundOptions) (adapter.Inbound, error) {
@@ -71,7 +78,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	} else {
 		udpTimeout = C.UDPTimeout
 	}
-	service, err := tuic.NewService[int](tuic.ServiceOptions{
+	service, err := tuic.NewService[*inboundUser](tuic.ServiceOptions{
 		Context:           ctx,
 		Logger:            logger,
 		TLSConfig:         tlsConfig,
@@ -85,12 +92,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, err
 	}
-	var userList []int
+	var userList []*inboundUser
 	var userNameList []string
 	var userUUIDList [][16]byte
 	var userPasswordList []string
-	uidToUuid := make(map[int]string, len(options.Users))
-	uuidToUid := make(map[string]int, len(options.Users))
+	users := make(map[string]*inboundUser, len(options.Users))
 	for index, user := range options.Users {
 		if user.UUID == "" {
 			return nil, E.New("missing uuid for user ", index)
@@ -99,16 +105,20 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		if err != nil {
 			return nil, E.Cause(err, "invalid uuid for user ", index)
 		}
-		userList = append(userList, index)
-		userNameList = append(userNameList, user.Name)
+		if _, exists := users[user.UUID]; exists {
+			return nil, E.New("duplicate uuid for user ", index)
+		}
+		identity := &inboundUser{TUICUser: user, id: index}
+		users[user.UUID] = identity
+		userList = append(userList, identity)
+		userNameList = append(userNameList, user.UUID)
 		userUUIDList = append(userUUIDList, userUUID)
 		userPasswordList = append(userPasswordList, user.Password)
 	}
 	service.UpdateUsers(userList, userUUIDList, userPasswordList)
 	inbound.server = service
 	inbound.userNameList = userNameList
-	inbound.uidToUuid = uidToUuid
-	inbound.uuidToUid = uuidToUid
+	inbound.users = users
 	inbound.userconns = sync.Map{}
 	return inbound, nil
 }
@@ -125,20 +135,19 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.Source = source
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
-	userID, _ := auth.UserFromContext[int](ctx)
-	if userName, found := h.userName(userID); found {
+	user, _ := auth.UserFromContext[*inboundUser](ctx)
+	if userName, found := h.registerUserConnection(user, conn); found {
+		onClose = N.AppendClose(onClose, func(err error) {
+			h.userconns.Delete(conn)
+		})
 		if userName != "" {
 			metadata.User = userName
-			h.userconns.LoadOrStore(conn, userName)
-			onClose = N.AppendClose(onClose, func(err error) {
-				h.userconns.Delete(conn)
-			})
 			h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
 		} else {
 			h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
 		}
 	} else {
-		h.logger.WarnContext(ctx, "no valid user: ", userID, " for inbound connection to ", metadata.Destination)
+		h.logger.WarnContext(ctx, "no valid user for inbound connection to ", metadata.Destination)
 		conn.Close()
 		return
 	}
@@ -157,20 +166,19 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.Source = source
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
-	userID, _ := auth.UserFromContext[int](ctx)
-	if userName, found := h.userName(userID); found {
+	user, _ := auth.UserFromContext[*inboundUser](ctx)
+	if userName, found := h.registerUserConnection(user, conn); found {
+		onClose = N.AppendClose(onClose, func(err error) {
+			h.userconns.Delete(conn)
+		})
 		if userName != "" {
 			metadata.User = userName
-			h.userconns.LoadOrStore(conn, userName)
-			onClose = N.AppendClose(onClose, func(err error) {
-				h.userconns.Delete(conn)
-			})
 			h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
 		} else {
 			h.logger.InfoContext(ctx, "inbound packet connection to ", metadata.Destination)
 		}
 	} else {
-		h.logger.WarnContext(ctx, "no valid user: ", userID, " for inbound packet connection to ", metadata.Destination)
+		h.logger.WarnContext(ctx, "no valid user for inbound packet connection to ", metadata.Destination)
 		conn.Close()
 		return
 	}
@@ -195,6 +203,17 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 }
 
 func (h *Inbound) Close() error {
+	h.usersAccess.Lock()
+	h.closed = true
+	retired := make(map[*inboundUser]struct{}, len(h.users))
+	for _, user := range h.users {
+		retired[user] = struct{}{}
+	}
+	h.users = nil
+	h.userNameList = nil
+	conns := h.detachUsersLocked(retired)
+	h.usersAccess.Unlock()
+	closeUserConnections(conns)
 	return common.Close(
 		h.listener,
 		h.tlsConfig,
@@ -202,10 +221,12 @@ func (h *Inbound) Close() error {
 	)
 }
 
-// userName resolves an authenticated user ID; safe while users change.
-func (h *Inbound) userName(id int) (string, bool) {
+func (h *Inbound) registerUserConnection(user *inboundUser, conn io.Closer) (string, bool) {
 	h.usersAccess.RLock()
 	defer h.usersAccess.RUnlock()
-	name, found := h.uidToUuid[id]
-	return name, found
+	if h.closed || user == nil || h.users[user.UUID] != user {
+		return "", false
+	}
+	h.userconns.Store(conn, user)
+	return user.UUID, true
 }
